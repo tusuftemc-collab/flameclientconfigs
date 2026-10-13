@@ -50,6 +50,12 @@ const STRIKE_LIMIT = Number(process.env.STRIKE_LIMIT) || 20;
 const STRIKE_WINDOW = Number(process.env.STRIKE_WINDOW_SEC) || 600;
 const BAN_SECONDS = Number(process.env.BAN_SECONDS) || 3600;
 
+// Admin (public listeyi yonetme) kilidi: yanlis anahtari ADMIN_TRIES kez giren IP,
+// ADMIN_LOCK_SECONDS boyunca admin islemi yapamaz. Parola (ADMIN_KEY) jar'da DEGIL,
+// yalnizca burada tutulur; istemci oyuncunun yazdigini gonderir, dogrulama burada olur.
+const ADMIN_TRIES = Number(process.env.ADMIN_TRIES) || 3;
+const ADMIN_LOCK_SECONDS = (Number(process.env.ADMIN_LOCK_HOURS) || 5) * 3600;
+
 const ROUTES = {
   GET: { bucket: 'get', max: () => LOOKUPS_PER_MIN, window: 60 },
   POST: { bucket: 'put', max: () => UPLOADS_PER_10_MIN, window: 600 },
@@ -83,6 +89,7 @@ export default async function handler(req, res) {
 
     if (req.method === 'POST') return await upload(req, res, ip);
     if (req.method === 'DELETE') return await unpublish(req, res, ip);
+    if (queryParam(req, 'admin') === 'verify') return await adminVerify(req, res, ip);
     if (queryParam(req, 'list')) return await listPublic(req, res, ip);
     return await lookup(req, res, ip);
   } catch (err) {
@@ -267,15 +274,62 @@ async function upload(req, res, ip) {
   return send(res, 503, { error: 'Could not allocate a code, try again' });
 }
 
-// ---- DELETE: (yalnizca sahip) public listeden kaldir / tamamen sil ----
+// ---- Admin: parola dogrula (istemci admin modunu acar) ----
+
+async function adminVerify(req, res, ip) {
+  if (!(await requireAdmin(req, res, ip))) return;
+  return send(res, 200, { admin: true });
+}
+
+/**
+ * Admin anahtarini dogrular. ADMIN_KEY ayarli degilse admin tamamen kapali (404).
+ * Yanlis anahtar ADMIN_TRIES kez girilirse IP ADMIN_LOCK_SECONDS boyunca kilitlenir.
+ * Dogrulanirsa true, aksi halde yaniti yollar ve false doner.
+ */
+async function requireAdmin(req, res, ip) {
+  const adminKey = process.env.ADMIN_KEY;
+  if (!adminKey) {
+    send(res, 404, { error: 'Not found' });
+    return false;
+  }
+
+  const [locked] = await redis([['GET', 'admlock:' + ip]]);
+  if (locked != null) {
+    send(res, 403, { error: 'Admin locked, try again later' });
+    return false;
+  }
+
+  if (!safeEqual(header(req, 'x-admin-key'), adminKey)) {
+    const left = await adminFail(ip);
+    send(res, 401, { error: left > 0 ? 'Wrong password' : 'Admin locked', attemptsLeft: Math.max(0, left) });
+    return false;
+  }
+
+  await redis([['DEL', 'admtry:' + ip]]); // basarili giris sayaci sifirlar
+  return true;
+}
+
+/** Yanlis admin denemesini sayar; ADMIN_TRIES'a ulasinca IP'yi kilitler. Kalan hak doner. */
+async function adminFail(ip) {
+  const key = 'admtry:' + ip;
+  const [, count] = await redis([
+    ['SET', key, '0', 'EX', String(ADMIN_LOCK_SECONDS), 'NX'],
+    ['INCR', key],
+  ]);
+
+  const used = Number(count);
+  if (used >= ADMIN_TRIES) {
+    await redis([['SET', 'admlock:' + ip, String(Date.now()), 'EX', String(ADMIN_LOCK_SECONDS)]]);
+    return 0;
+  }
+
+  return ADMIN_TRIES - used;
+}
+
+// ---- DELETE: (yalnizca admin) public listeden kaldir / tamamen sil ----
 
 async function unpublish(req, res, ip) {
-  const adminKey = process.env.ADMIN_KEY;
-  if (!adminKey)
-    return deny(res, ip, 2, 404, 'Not found'); // anahtar ayarlanmadiysa bu islem kapali
-
-  if (!safeEqual(header(req, 'x-admin-key'), adminKey))
-    return deny(res, ip, 5, 401, 'Unauthorized');
+  if (!(await requireAdmin(req, res, ip))) return;
 
   const code = normalize(queryParam(req, 'code'));
   if (!CODE_PATTERN.test(code))

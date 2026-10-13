@@ -148,20 +148,26 @@ config'i günceller; senin kendi config'lerinle de çakışmaz.
 
 ---
 
-## 8) Public listeden kaldırma (sadece sen)
+## 8) Admin — public listeden kaldırma
 
 Herkes public yayınlayabildiği için uygunsuz bir config'i listeden kaldırma yetkisi
-**yalnızca sende** olur. Bunun için ayrı bir **ADMIN_KEY** kullanılır — bu anahtar
-**jar'a ve bu repoya asla girmez**, sadece Vercel'de ve senin bilgisayarında durur.
+**yalnızca sende** olur. Bunun için bir **ADMIN_KEY** (admin parolası) kullanılır — bu
+parola **jar'a ve bu repoya asla girmez**, sadece Vercel'de durur ve oyunda sen
+yazarsın; sunucu doğrular. Jar decompile edilse bile parola ele geçmez.
 
-1. Anahtar üret (çıktıyı kimseyle paylaşma, bir yere not et):
-   ```bash
-   node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
-   ```
-2. Vercel → **Settings → Environment Variables** → `ADMIN_KEY` = üretilen değer
-   (Production) → kaydet → **Redeploy**.
+**Kurulum:** Vercel → **Settings → Environment Variables** → `ADMIN_KEY` =
+`310715iiiaaabbb` (oyundaki admin parolan) → Production → kaydet → **Redeploy**.
+(Ayrı env ile değiştirilebilir: `ADMIN_TRIES` varsayılan 3, `ADMIN_LOCK_HOURS` varsayılan 5.)
 
-Kullanım (PowerShell'de `curl.exe`, Git Bash'te `curl`):
+**Oyun içi admin girişi:**
+1. Menüde **sol alt köşede** çok küçük, soluk bir **·** var (zor görünür). Ona tıkla.
+2. Açılan minik kutuya admin parolanı yaz → **Enter**. Doğruysa sol altta **admin** yazar.
+3. Artık **Configs → Import → Public** listesinde her satırın sağında bir **çöp kutusu**
+   çıkar; ona tıklayınca o config public listeden kaldırılır (kodla hâlâ yüklenebilir kalır).
+4. Çıkış: tekrar sol alttaki **admin** yazısına tıkla.
+5. Parolayı **3 kez yanlış** giren IP **5 saat** admin girişi yapamaz (normal kullanım etkilenmez).
+
+İstersen curl ile de yönetebilirsin (PowerShell'de `curl.exe`, Git Bash'te `curl`):
 
 ```bash
 # Public listeden kaldır (config kodla yüklenebilir kalır, private'a döner)
@@ -171,8 +177,8 @@ curl -X DELETE "https://flame-client-configs.vercel.app/api/config?code=XXXX-XXX
 curl -X DELETE "https://flame-client-configs.vercel.app/api/config?code=XXXX-XXXX&purge=1" -H "x-admin-key: ADMIN_KEY_DEGERIN"
 ```
 
-`ADMIN_KEY` ayarlı değilse bu işlem tamamen kapalıdır (404). Yanlış anahtarla deneyen
-IP 4. denemede otomatik banlanır.
+`ADMIN_KEY` ayarlı değilse admin tamamen kapalıdır (404). Yanlış parolayı 3 kez giren
+IP 5 saat admin işlemi yapamaz.
 
 Public listeye curl ile bakmak:
 
