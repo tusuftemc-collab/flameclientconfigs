@@ -1,23 +1,31 @@
 // Flame V1 Cloud Configs — Vercel Function
 //
-//   POST /api/config             body: { "name": "...", "config": { ... } }
-//        -> 201 { code, display }          (ayni config tekrar yuklenirse 200 + ayni kod)
-//   GET  /api/config?code=XXXX-XXXX
-//        -> 200 { code, display, name, server, created, config }  |  404
+//   POST   /api/config                     body: { "name", "config", "visibility": "public"|"private" }
+//          -> 201 { code, display, visibility }   (ayni config tekrar yuklenirse 200 + ayni kod)
+//   GET    /api/config?code=XXXX-XXXX
+//          -> 200 { code, display, name, server, created, visibility, config }  |  404
+//   GET    /api/config?list=public&sort=top|new&page=0
+//          -> 200 { items: [{ code, display, name, server, created, modules, downloads }], page, more }
+//   DELETE /api/config?code=XXXX-XXXX[&purge=1]   (header x-admin-key: ADMIN_KEY)
+//          -> 200 { unpublished, purged }        public listeden kaldirir (purge=1: tamamen siler)
 //
-// Depolama: Upstash Redis (Vercel Marketplace). Liste/arama endpoint'i YOKTUR:
-// bir config'e yalnizca tam kodunu bilen ulasabilir.
+// Private config'ler listelenmez; yalnizca tam kodunu bilen ulasabilir. Public config'ler
+// ayrica herkese acik listede gorunur (oyun ici "Public" sekmesi).
+//
+// Depolama: Upstash Redis (Vercel Marketplace).
+//   cfg:CODE      tam kayit { v, name, server, created, visibility, owner, config }
+//   meta:CODE     public listede gosterilen hafif ozet (config govdesi yok)
+//   public:new    sorted set (skor = olusturma zamani)
+//   public:top    sorted set (skor = indirme sayisi)
 //
 // Guvenlik katmanlari (savunma derinligi):
-//   1) Katı girdi dogrulama + boyut siniri + yalnizca GET/POST.
-//   2) Yukleme icin zorunlu anahtar (UPLOAD_KEY) — rastgele kimse DB dolduramaz.
-//   3) IP basina hiz siniri (rate limit) -> 429.
+//   1) Katı girdi dogrulama + boyut siniri + yalnizca GET/POST/DELETE.
+//   2) Yukleme icin zorunlu anahtar (UPLOAD_KEY); listeden kaldirma icin ayri ADMIN_KEY.
+//   3) IP basina hiz siniri (rate limit) -> 429; public yayin icin ayrica saatlik sinir.
 //   4) Kotu/basarisiz istekler "strike" toplar; esigi gecen IP otomatik BANLANIR -> 403.
 //   5) Kodlar 8 hane x 30 harf ~ 6.5e11 kombinasyon; ban + limit ile kaba kuvvet imkansiz.
-//   6) Parametreli Redis komutlari (enjeksiyon yok), gizli indeksleme engeli, siki basliklar.
-//
-// Ileride UID/HWID: entry semasi "v" ile surumlu ve "owner" alanina acik; yukleme
-// akisina UID/HWID dogrulamasi eklemek bu yapiyi bozmadan yapilabilir.
+//   6) Indirme sayaci IP+kod basina gunde 1 kez artar (sayac sisirilemez).
+//   7) Parametreli Redis komutlari (enjeksiyon yok), gizli indeksleme engeli, siki basliklar.
 
 import { createHash, randomInt, timingSafeEqual } from 'node:crypto';
 
@@ -31,11 +39,22 @@ const TTL_SECONDS = (Number(process.env.CONFIG_TTL_DAYS) || 0) * 86400;
 
 const UPLOADS_PER_10_MIN = Number(process.env.UPLOAD_LIMIT) || 20;
 const LOOKUPS_PER_MIN = Number(process.env.LOOKUP_LIMIT) || 60;
+const PUBLIC_PER_HOUR = Number(process.env.PUBLIC_LIMIT) || 5;
+const ADMIN_PER_10_MIN = 60;
+
+const PAGE_SIZE = 20;
+const MAX_PAGE = 500;
 
 // Otomatik ban: STRIKE_WINDOW icinde STRIKE_LIMIT puani gecen IP, BAN_SECONDS boyunca 403 alir.
 const STRIKE_LIMIT = Number(process.env.STRIKE_LIMIT) || 20;
 const STRIKE_WINDOW = Number(process.env.STRIKE_WINDOW_SEC) || 600;
 const BAN_SECONDS = Number(process.env.BAN_SECONDS) || 3600;
+
+const ROUTES = {
+  GET: { bucket: 'get', max: () => LOOKUPS_PER_MIN, window: 60 },
+  POST: { bucket: 'put', max: () => UPLOADS_PER_10_MIN, window: 600 },
+  DELETE: { bucket: 'adm', max: () => ADMIN_PER_10_MIN, window: 600 },
+};
 
 export default async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store');
@@ -45,15 +64,14 @@ export default async function handler(req, res) {
   const ip = clientIp(req);
 
   try {
-    if (req.method !== 'GET' && req.method !== 'POST') {
-      res.setHeader('Allow', 'GET, POST');
+    const route = ROUTES[req.method];
+    if (!route) {
+      res.setHeader('Allow', 'GET, POST, DELETE');
       return deny(res, ip, 2, 405, 'Method not allowed');
     }
 
     // 1) Hiz siniri + ban kontrolu (tek Redis turunda).
-    const gate = await arrive(ip, req.method === 'POST' ? 'put' : 'get',
-      req.method === 'POST' ? UPLOADS_PER_10_MIN : LOOKUPS_PER_MIN,
-      req.method === 'POST' ? 600 : 60);
+    const gate = await arrive(ip, route.bucket, route.max(), route.window);
 
     if (gate.banned)
       return send(res, 403, { error: 'Temporarily blocked' });
@@ -63,7 +81,10 @@ export default async function handler(req, res) {
       return send(res, banned ? 403 : 429, { error: banned ? 'Temporarily blocked' : 'Too many requests, slow down' });
     }
 
-    return req.method === 'POST' ? await upload(req, res, ip) : await lookup(req, res, ip);
+    if (req.method === 'POST') return await upload(req, res, ip);
+    if (req.method === 'DELETE') return await unpublish(req, res, ip);
+    if (queryParam(req, 'list')) return await listPublic(req, res, ip);
+    return await lookup(req, res, ip);
   } catch (err) {
     const message = String((err && err.message) || err);
     if (message === 'storage-not-configured')
@@ -81,7 +102,10 @@ async function lookup(req, res, ip) {
   if (!CODE_PATTERN.test(code))
     return deny(res, ip, 3, 400, 'Invalid code'); // bicimi bozuk kod = otomatik tarama sinyali
 
-  const [raw] = await redis([['GET', storageKey(code)]]);
+  const [raw, score] = await redis([
+    ['GET', storageKey(code)],
+    ['ZSCORE', 'public:top', code],
+  ]);
   if (!raw)
     return deny(res, ip, 1, 404, 'Code not found'); // bos deneme = kaba kuvvet sinyali
 
@@ -92,14 +116,86 @@ async function lookup(req, res, ip) {
     return send(res, 500, { error: 'Corrupted entry' });
   }
 
+  const isPublic = score != null;
+
+  // Public indirme sayaci: ayni IP ayni config'i gunde en fazla 1 kez sayar.
+  if (isPublic) {
+    const [first] = await redis([['SET', `dl:${ip}:${code}`, '1', 'EX', '86400', 'NX']]);
+    if (first === 'OK') await redis([['ZINCRBY', 'public:top', '1', code]]);
+  }
+
   return send(res, 200, {
     code,
     display: display(code),
     name: entry.name,
     server: entry.server || '',
     created: entry.created,
+    visibility: isPublic ? 'public' : 'private',
     config: entry.config,
   });
+}
+
+// ---- GET ?list=public: herkese acik config listesi ----
+
+async function listPublic(req, res, ip) {
+  if (queryParam(req, 'list') !== 'public')
+    return deny(res, ip, 3, 400, 'Unknown list');
+
+  const sort = queryParam(req, 'sort') === 'new' ? 'new' : 'top';
+  const page = Math.max(0, Math.min(MAX_PAGE, Number.parseInt(queryParam(req, 'page'), 10) || 0));
+  const index = sort === 'new' ? 'public:new' : 'public:top';
+  const start = page * PAGE_SIZE;
+  const stop = start + PAGE_SIZE - 1;
+
+  const [range, total] = await redis([
+    sort === 'top'
+      ? ['ZRANGE', index, String(start), String(stop), 'REV', 'WITHSCORES']
+      : ['ZRANGE', index, String(start), String(stop), 'REV'],
+    ['ZCARD', index],
+  ]);
+
+  const codes = [];
+  const downloads = new Map();
+  if (sort === 'top') {
+    for (let i = 0; i + 1 < (range || []).length; i += 2) {
+      codes.push(range[i]);
+      downloads.set(range[i], Number(range[i + 1]) || 0);
+    }
+  } else {
+    codes.push(...(range || []));
+  }
+
+  let items = [];
+  if (codes.length > 0) {
+    const commands = codes.map((code) => ['GET', 'meta:' + code]);
+    if (sort === 'new') commands.push(['ZMSCORE', 'public:top', ...codes]);
+
+    const results = await redis(commands);
+    const scores = sort === 'new' ? results[codes.length] || [] : null;
+
+    items = codes
+      .map((code, i) => {
+        let meta;
+        try {
+          meta = JSON.parse(results[i]);
+        } catch {
+          return null;
+        }
+        if (!meta) return null;
+        return {
+          code,
+          display: display(code),
+          name: meta.name,
+          server: meta.server || '',
+          created: meta.created,
+          modules: meta.modules || 0,
+          downloads: sort === 'top' ? downloads.get(code) || 0 : Number(scores[i]) || 0,
+        };
+      })
+      .filter(Boolean);
+  }
+
+  return send(res, 200, { items, page, more: start + PAGE_SIZE < Number(total || 0) });
 }
 
 // ---- POST: config yukle, benzersiz kod al ----
@@ -121,18 +217,30 @@ async function upload(req, res, ip) {
   if (Buffer.byteLength(configJson, 'utf8') > MAX_BYTES)
     return deny(res, ip, 3, 413, 'Config is too large');
 
+  const visibility = body.visibility === 'public' ? 'public' : 'private';
   const name = cleanName(body.name);
   const server = serverName(config);
-  const hash = createHash('sha256').update(name + '\n' + configJson).digest('hex');
+  const hash = createHash('sha256').update(visibility + '\n' + name + '\n' + configJson).digest('hex');
 
-  // Ayni config tekrar yuklenirse ayni kodu ver (gereksiz kopya olusmasin).
+  // Ayni config tekrar yuklenirse ayni kodu ver (gereksiz kopya / listede tekrar olusmasin).
   const [known] = await redis([['GET', 'hash:' + hash]]);
   if (known && CODE_PATTERN.test(known)) {
     const [exists] = await redis([['EXISTS', storageKey(known)]]);
-    if (Number(exists) === 1) return send(res, 200, { code: known, display: display(known), reused: true });
+    if (Number(exists) === 1)
+      return send(res, 200, { code: known, display: display(known), visibility, reused: true });
   }
 
-  const entry = JSON.stringify({ v: 1, name, server, created: Date.now(), owner: null, config });
+  // Public yayin icin ayrica saatlik sinir (listenin spam ile dolmasini onler).
+  if (visibility === 'public') {
+    const pub = await arrive(ip, 'pub', PUBLIC_PER_HOUR, 3600);
+    if (pub.limited) {
+      const banned = await strike(ip, 2);
+      return send(res, banned ? 403 : 429, { error: banned ? 'Temporarily blocked' : 'Public upload limit reached, try later' });
+    }
+  }
+
+  const created = Date.now();
+  const entry = JSON.stringify({ v: 2, name, server, created, visibility, owner: null, config });
 
   // Cakisma onleme: SET ... NX yalnizca anahtar YOKSA yazar. Kod doluysa yenisi denenir,
   // boylece iki config asla ayni kodu alamaz ve hicbir config'in ustune yazilmaz.
@@ -142,15 +250,51 @@ async function upload(req, res, ip) {
     if (TTL_SECONDS > 0) set.push('EX', String(TTL_SECONDS));
 
     const [ok] = await redis([set]);
-    if (ok === 'OK') {
-      const link = ['SET', 'hash:' + hash, code];
-      if (TTL_SECONDS > 0) link.push('EX', String(TTL_SECONDS));
-      await redis([link]);
-      return send(res, 201, { code, display: display(code) });
+    if (ok !== 'OK') continue;
+
+    const after = [ttl(['SET', 'hash:' + hash, code])];
+    if (visibility === 'public') {
+      const meta = JSON.stringify({ name, server, created, modules: enabledModules(config) });
+      after.push(ttl(['SET', 'meta:' + code, meta]));
+      after.push(['ZADD', 'public:new', String(created), code]);
+      after.push(['ZADD', 'public:top', '0', code]);
     }
+    await redis(after);
+
+    return send(res, 201, { code, display: display(code), visibility });
   }
 
   return send(res, 503, { error: 'Could not allocate a code, try again' });
+}
+
+// ---- DELETE: (yalnizca sahip) public listeden kaldir / tamamen sil ----
+
+async function unpublish(req, res, ip) {
+  const adminKey = process.env.ADMIN_KEY;
+  if (!adminKey)
+    return deny(res, ip, 2, 404, 'Not found'); // anahtar ayarlanmadiysa bu islem kapali
+
+  if (!safeEqual(header(req, 'x-admin-key'), adminKey))
+    return deny(res, ip, 5, 401, 'Unauthorized');
+
+  const code = normalize(queryParam(req, 'code'));
+  if (!CODE_PATTERN.test(code))
+    return deny(res, ip, 3, 400, 'Invalid code');
+
+  const purge = queryParam(req, 'purge') === '1';
+  const commands = [
+    ['ZREM', 'public:new', code],
+    ['ZREM', 'public:top', code],
+    ['DEL', 'meta:' + code],
+  ];
+  if (purge) commands.push(['DEL', storageKey(code)]);
+
+  const results = await redis(commands);
+  return send(res, 200, {
+    code,
+    unpublished: Number(results[1]) > 0 || Number(results[0]) > 0,
+    purged: purge ? Number(results[3]) > 0 : false,
+  });
 }
 
 // ---- Guvenlik: hiz siniri, strike, otomatik ban ----
@@ -202,6 +346,11 @@ function storageKey(code) {
   return 'cfg:' + code;
 }
 
+function ttl(command) {
+  if (TTL_SECONDS > 0) command.push('EX', String(TTL_SECONDS));
+  return command;
+}
+
 function newCode() {
   let code = '';
   for (let i = 0; i < CODE_LENGTH; i++) code += ALPHABET[randomInt(ALPHABET.length)];
@@ -228,7 +377,14 @@ function serverName(config) {
   const name = typeof server.name === 'string' ? server.name : '';
   if (name.toLowerCase() === 'singleplayer') return 'Singleplayer';
 
-  return (name || (typeof server.ip === 'string' ? server.ip : '')).slice(0, 64);
+  return (name || (typeof server.ip === 'string' ? server.ip : '')).replace(/[^\w .:-]/g, '').slice(0, 64);
+}
+
+function enabledModules(config) {
+  let count = 0;
+  for (const [key, value] of Object.entries(config))
+    if (key !== 'server' && value && typeof value === 'object' && value.enabled === true) count++;
+  return count;
 }
 
 /** Flame V1 config'i mi: en az bir { enabled: boolean } modul objesi olmali. */
@@ -257,7 +413,7 @@ function header(req, name) {
 function queryParam(req, name) {
   if (req.query && req.query[name] !== undefined) {
     const value = req.query[name];
-    return Array.isArray(value) ? value[0] : value;
+    return String(Array.isArray(value) ? value[0] : value);
   }
 
   try {
