@@ -1,0 +1,6 @@
+{
+  "name": "flamev1-cloud",
+  "private": true,
+  "type": "module",
+  "description": "Flame V1 cloud configs (Vercel + Upstash Redis)"
+}
