@@ -1,7 +1,9 @@
 // Flame V1 Cloud Configs — Vercel Function
 //
 //   POST   /api/config                     body: { "name", "config", "visibility": "public"|"private" }
-//          -> 201 { code, display, visibility }   (ayni config tekrar yuklenirse 200 + ayni kod)
+//          -> 201 { code, display, visibility, owner }   (ayni config tekrar yuklenirse 200 + ayni kod)
+//          body'ye { "code", "owner" } eklenirse (daha onceki yanittan) o kodun USTUNE yazar
+//          -> 200 { code, display, visibility, owner, updated:true }   (owner eslesmezse yeni kod uretir)
 //   GET    /api/config?code=XXXX-XXXX
 //          -> 200 { code, display, name, server, created, visibility, config }  |  404
 //   GET    /api/config?list=public&sort=top|new&page=0
@@ -27,7 +29,7 @@
 //   6) Indirme sayaci IP+kod basina gunde 1 kez artar (sayac sisirilemez).
 //   7) Parametreli Redis komutlari (enjeksiyon yok), gizli indeksleme engeli, siki basliklar.
 
-import { createHash, randomInt, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
 
 // 0/1/I/L/O/U yok: okurken/yazarken karistirilmasin.
 const ALPHABET = '23456789ABCDEFGHJKMNPQRSTVWXYZ';
@@ -229,6 +231,65 @@ async function upload(req, res, ip) {
   const server = serverName(config);
   const hash = createHash('sha256').update(visibility + '\n' + name + '\n' + configJson).digest('hex');
 
+  // GUNCELLEME: istemci daha once aldigi kodu + sahiplik jetonunu (owner) yollarsa, YENI kod
+  // uretmek yerine ayni kaydin uzerine yaz (gereksiz depolama ve public listede kirlilik olmaz).
+  // Jeton eslesmezse ya da kod yoksa sessizce yeni kod uretme yoluna duseriz; boylece
+  // baskasinin config'i ASLA ezilemez, kullanici da her zaman kullanilabilir bir kod alir.
+  const wantCode = normalize(body.code || '');
+  const wantToken = typeof body.owner === 'string' ? body.owner : '';
+  if (wantCode && CODE_PATTERN.test(wantCode) && wantToken) {
+    const [rawOld] = await redis([['GET', storageKey(wantCode)]]);
+    if (rawOld) {
+      let old = null;
+      try { old = JSON.parse(rawOld); } catch { old = null; }
+
+      if (old && old.owner && safeEqual(wantToken, old.owner)) {
+        const nowPublic = visibility === 'public';
+        const wasPublic = old.visibility === 'public';
+
+        // Yeni public olunuyorsa (private -> public) saatlik public sinirini uygula.
+        if (nowPublic && !wasPublic) {
+          const pub = await arrive(ip, 'pub', PUBLIC_PER_HOUR, 3600);
+          if (pub.limited) {
+            const banned = await strike(ip, 2);
+            return send(res, banned ? 403 : 429, { error: banned ? 'Temporarily blocked' : 'Public upload limit reached, try later' });
+          }
+        }
+
+        const created = Number(old.created) || Date.now();
+        const entry = JSON.stringify({ v: 2, name, server, created, modified: Date.now(), visibility, owner: old.owner, config });
+        const after = [ttl(['SET', storageKey(wantCode), entry])]; // NX YOK: bilerek ustune yaz
+
+        // Eski icerik hash'ini temizle, yenisini bagla (yoksa eski icerik tekrar yuklenince
+        // "reused" ile artik gecersiz bir kod donebilirdi).
+        const oldHash = createHash('sha256')
+          .update((wasPublic ? 'public' : 'private') + '\n' + (old.name || '') + '\n' + JSON.stringify(old.config))
+          .digest('hex');
+        if (oldHash !== hash) after.push(['DEL', 'hash:' + oldHash]);
+        after.push(ttl(['SET', 'hash:' + hash, wantCode]));
+
+        // Public set/meta durumunu yeni gorunurluge esitle.
+        if (nowPublic) {
+          const meta = JSON.stringify({ name, server, created, modules: enabledModules(config) });
+          after.push(ttl(['SET', 'meta:' + wantCode, meta]));
+          if (!wasPublic) {
+            after.push(['ZADD', 'public:new', String(created), wantCode]);
+            after.push(['ZADD', 'public:top', '0', wantCode]);
+          }
+        } else if (wasPublic) {
+          after.push(['ZREM', 'public:new', wantCode]);
+          after.push(['ZREM', 'public:top', wantCode]);
+          after.push(['DEL', 'meta:' + wantCode]);
+        }
+
+        await redis(after);
+        return send(res, 200, { code: wantCode, display: display(wantCode), visibility, owner: old.owner, updated: true });
+      }
+      // Sahiplik yok/yanlis: ezme, yeni kod uret (asagi dus).
+    }
+    // Kod verildi ama kayit yok (silinmis/suresi dolmus): yeni kod uret (asagi dus).
+  }
+
   // Ayni config tekrar yuklenirse ayni kodu ver (gereksiz kopya / listede tekrar olusmasin).
   const [known] = await redis([['GET', 'hash:' + hash]]);
   if (known && CODE_PATTERN.test(known)) {
@@ -247,7 +308,8 @@ async function upload(req, res, ip) {
   }
 
   const created = Date.now();
-  const entry = JSON.stringify({ v: 2, name, server, created, visibility, owner: null, config });
+  const owner = newToken(); // istemci bunu saklar, ileride ayni config'i guncellemek icin yollar
+  const entry = JSON.stringify({ v: 2, name, server, created, visibility, owner, config });
 
   // Cakisma onleme: SET ... NX yalnizca anahtar YOKSA yazar. Kod doluysa yenisi denenir,
   // boylece iki config asla ayni kodu alamaz ve hicbir config'in ustune yazilmaz.
@@ -268,7 +330,7 @@ async function upload(req, res, ip) {
     }
     await redis(after);
 
-    return send(res, 201, { code, display: display(code), visibility });
+    return send(res, 201, { code, display: display(code), visibility, owner });
   }
 
   return send(res, 503, { error: 'Could not allocate a code, try again' });
@@ -409,6 +471,12 @@ function newCode() {
   let code = '';
   for (let i = 0; i < CODE_LENGTH; i++) code += ALPHABET[randomInt(ALPHABET.length)];
   return code;
+}
+
+// Sahiplik jetonu: config'i olusturan istemciye verilir, yalnizca o config'i GUNCELLEYEBILMEK
+// (ayni kodun uzerine yazmak) icin gerekir. Kayitta saklanir, GET ile asla dondurulmez.
+function newToken() {
+  return randomBytes(24).toString('base64url');
 }
 
 function normalize(value) {
