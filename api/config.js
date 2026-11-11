@@ -8,7 +8,7 @@
 //          -> 200 { code, display, name, server, created, visibility, config }  |  404
 //   GET    /api/config?list=public&sort=top|new&page=0
 //          -> 200 { items: [{ code, display, name, server, created, modules, downloads }], page, more }
-//   DELETE /api/config?code=XXXX-XXXX[&purge=1]   (header x-admin-key: ADMIN_KEY)
+//   DELETE /api/config?code=XXXX-XXXX[&purge=1]   (header x-admin-token: hesap sitesinin imzali admin gecisi)
 //          -> 200 { unpublished, purged }        public listeden kaldirir (purge=1: tamamen siler)
 //
 // Private config'ler listelenmez; yalnizca tam kodunu bilen ulasabilir. Public config'ler
@@ -22,14 +22,25 @@
 //
 // Guvenlik katmanlari (savunma derinligi):
 //   1) Katı girdi dogrulama + boyut siniri + yalnizca GET/POST/DELETE.
-//   2) Yukleme icin zorunlu anahtar (UPLOAD_KEY); listeden kaldirma icin ayri ADMIN_KEY.
+//   2) Yukleme icin zorunlu anahtar (UPLOAD_KEY). Admin islemleri PAROLASIZ: Flame hesap sitesi yetkili
+//      hesaplara kisa omurlu, Ed25519 ile imzali bir "admin gecisi" verir; burada yalnizca ACIK anahtarla
+//      dogrulanir (tahmin edilecek/sizacak bir parola yok).
 //   3) IP basina hiz siniri (rate limit) -> 429; public yayin icin ayrica saatlik sinir.
 //   4) Kotu/basarisiz istekler "strike" toplar; esigi gecen IP otomatik BANLANIR -> 403.
 //   5) Kodlar 8 hane x 30 harf ~ 6.5e11 kombinasyon; ban + limit ile kaba kuvvet imkansiz.
 //   6) Indirme sayaci IP+kod basina gunde 1 kez artar (sayac sisirilemez).
 //   7) Parametreli Redis komutlari (enjeksiyon yok), gizli indeksleme engeli, siki basliklar.
 
-import { createHash, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
+import { createHash, createPublicKey, randomBytes, randomInt, timingSafeEqual, verify } from 'node:crypto';
+
+// Hesap sitesinin admin-gecisi imza anahtarinin ACIK yarisi (gizli degildir; ozel yarisi yalnizca
+// hesap sitesinin Vercel ortaminda CLOUD_ADMIN_KEY olarak durur).
+const ADMIN_PUBLIC_HEX = process.env.CLOUD_ADMIN_PUBLIC_KEY || '20f2532b413806ee113563609e06c036995240994dbb6d0a732869862189cb3d';
+const ADMIN_PUBLIC = createPublicKey({
+  key: Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), Buffer.from(ADMIN_PUBLIC_HEX, 'hex')]),
+  format: 'der',
+  type: 'spki',
+});
 
 // 0/1/I/L/O/U yok: okurken/yazarken karistirilmasin.
 const ALPHABET = '23456789ABCDEFGHJKMNPQRSTVWXYZ';
@@ -59,12 +70,6 @@ const MAX_PAGE = 500;
 const STRIKE_LIMIT = Number(process.env.STRIKE_LIMIT) || 20;
 const STRIKE_WINDOW = Number(process.env.STRIKE_WINDOW_SEC) || 600;
 const BAN_SECONDS = Number(process.env.BAN_SECONDS) || 3600;
-
-// Admin (public listeyi yonetme) kilidi: yanlis anahtari ADMIN_TRIES kez giren IP,
-// ADMIN_LOCK_SECONDS boyunca admin islemi yapamaz. Parola (ADMIN_KEY) jar'da DEGIL,
-// yalnizca burada tutulur; istemci oyuncunun yazdigini gonderir, dogrulama burada olur.
-const ADMIN_TRIES = Number(process.env.ADMIN_TRIES) || 3;
-const ADMIN_LOCK_SECONDS = (Number(process.env.ADMIN_LOCK_HOURS) || 5) * 3600;
 
 const ROUTES = {
   GET: { bucket: 'get', max: () => LOOKUPS_PER_MIN, window: 60 },
@@ -351,7 +356,7 @@ async function upload(req, res, ip) {
   return send(res, 503, { error: 'Could not allocate a code, try again' });
 }
 
-// ---- Admin: parola dogrula (istemci admin modunu acar) ----
+// ---- Admin: gecis dogrula (istemci admin modunu gosterir) ----
 
 async function adminVerify(req, res, ip) {
   if (!(await requireAdmin(req, res, ip))) return;
@@ -359,48 +364,27 @@ async function adminVerify(req, res, ip) {
 }
 
 /**
- * Admin anahtarini dogrular. ADMIN_KEY ayarli degilse admin tamamen kapali (404).
- * Yanlis anahtar ADMIN_TRIES kez girilirse IP ADMIN_LOCK_SECONDS boyunca kilitlenir.
- * Dogrulanirsa true, aksi halde yaniti yollar ve false doner.
+ * Admin gecisini dogrular (header x-admin-token = "<veri>.<imza>", base64url). Imza hesap sitesinin
+ * Ed25519 anahtariyla atilmis, suresi dolmamis ve hedefi bu bulut olmali. Dogruysa true; degilse yaniti yollar.
  */
 async function requireAdmin(req, res, ip) {
-  const adminKey = process.env.ADMIN_KEY;
-  if (!adminKey) {
-    send(res, 404, { error: 'Not found' });
+  const token = String(header(req, 'x-admin-token') || '');
+  const dot = token.indexOf('.');
+  let payload = null;
+  if (dot > 0 && token.length < 2000) {
+    const data = token.slice(0, dot);
+    try {
+      const ok = verify(null, Buffer.from(data), ADMIN_PUBLIC, Buffer.from(token.slice(dot + 1), 'base64url'));
+      if (ok) payload = JSON.parse(Buffer.from(data, 'base64url').toString('utf8'));
+    } catch {
+      payload = null;
+    }
+  }
+  if (!payload || payload.v !== 1 || payload.aud !== 'flame-cloud-admin' || !(Number(payload.exp) > Date.now())) {
+    await deny(res, ip, 3, 401, 'Not an admin');
     return false;
   }
-
-  const [locked] = await redis([['GET', 'admlock:' + ip]]);
-  if (locked != null) {
-    send(res, 403, { error: 'Admin locked, try again later' });
-    return false;
-  }
-
-  if (!safeEqual(header(req, 'x-admin-key'), adminKey)) {
-    const left = await adminFail(ip);
-    send(res, 401, { error: left > 0 ? 'Wrong password' : 'Admin locked', attemptsLeft: Math.max(0, left) });
-    return false;
-  }
-
-  await redis([['DEL', 'admtry:' + ip]]); // basarili giris sayaci sifirlar
   return true;
-}
-
-/** Yanlis admin denemesini sayar; ADMIN_TRIES'a ulasinca IP'yi kilitler. Kalan hak doner. */
-async function adminFail(ip) {
-  const key = 'admtry:' + ip;
-  const [, count] = await redis([
-    ['SET', key, '0', 'EX', String(ADMIN_LOCK_SECONDS), 'NX'],
-    ['INCR', key],
-  ]);
-
-  const used = Number(count);
-  if (used >= ADMIN_TRIES) {
-    await redis([['SET', 'admlock:' + ip, String(Date.now()), 'EX', String(ADMIN_LOCK_SECONDS)]]);
-    return 0;
-  }
-
-  return ADMIN_TRIES - used;
 }
 
 // ---- DELETE: (yalnizca admin) public listeden kaldir / tamamen sil ----
