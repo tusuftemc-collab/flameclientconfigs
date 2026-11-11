@@ -44,6 +44,14 @@ const LOOKUPS_PER_MIN = Number(process.env.LOOKUP_LIMIT) || 60;
 const PUBLIC_PER_HOUR = Number(process.env.PUBLIC_LIMIT) || 5;
 const ADMIN_PER_10_MIN = 60;
 
+// Herkese acik public yayin icin TUM IP'ler toplami (cok IP'li spam'e karsi).
+const PUBLIC_GLOBAL_PER_HOUR = Number(process.env.PUBLIC_GLOBAL_LIMIT) || 60;
+
+// Config yuklenince oyunda SUNUCUYA komut olarak gonderilen ayarlar. Paylasilan bir config bunlari
+// "/pay saldirgan 1000000" gibi bir seye cevirip yukleyeni soyamasin diye yalnizca bu komutlar gecer.
+const COMMAND_SETTINGS = { 'Auto RTP': ['Command'] };
+const SAFE_COMMAND = /^\/?(rtp|wild|randomtp|randomteleport|tpr|rtpgui)( [a-z0-9_:-]{1,24}){0,2}$/i;
+
 const PAGE_SIZE = 20;
 const MAX_PAGE = 500;
 
@@ -124,6 +132,9 @@ async function lookup(req, res, ip) {
   } catch {
     return send(res, 500, { error: 'Corrupted entry' });
   }
+
+  if (entry && entry.config && unsafeCommand(entry.config))
+    return send(res, 410, { error: 'This config was removed because it contained a blocked command' });
 
   const isPublic = score != null;
 
@@ -222,6 +233,10 @@ async function upload(req, res, ip) {
   if (!isConfig(config))
     return deny(res, ip, 3, 400, 'Not a Flame V1 config');
 
+  const unsafe = unsafeCommand(config);
+  if (unsafe)
+    return deny(res, ip, 5, 400, 'Config contains a blocked command in ' + unsafe);
+
   const configJson = JSON.stringify(config);
   if (Buffer.byteLength(configJson, 'utf8') > MAX_BYTES)
     return deny(res, ip, 3, 413, 'Config is too large');
@@ -249,7 +264,7 @@ async function upload(req, res, ip) {
 
         // Yeni public olunuyorsa (private -> public) saatlik public sinirini uygula.
         if (nowPublic && !wasPublic) {
-          const pub = await arrive(ip, 'pub', PUBLIC_PER_HOUR, 3600);
+          const pub = await publishGate(ip);
           if (pub.limited) {
             const banned = await strike(ip, 2);
             return send(res, banned ? 403 : 429, { error: banned ? 'Temporarily blocked' : 'Public upload limit reached, try later' });
@@ -300,7 +315,7 @@ async function upload(req, res, ip) {
 
   // Public yayin icin ayrica saatlik sinir (listenin spam ile dolmasini onler).
   if (visibility === 'public') {
-    const pub = await arrive(ip, 'pub', PUBLIC_PER_HOUR, 3600);
+    const pub = await publishGate(ip);
     if (pub.limited) {
       const banned = await strike(ip, 2);
       return send(res, banned ? 403 : 429, { error: banned ? 'Temporarily blocked' : 'Public upload limit reached, try later' });
@@ -411,6 +426,34 @@ async function unpublish(req, res, ip) {
     unpublished: Number(results[1]) > 0 || Number(results[0]) > 0,
     purged: purge ? Number(results[3]) > 0 : false,
   });
+}
+
+// ---- Public yayin kapisi: IP basina + global saatlik sinir ----
+
+async function publishGate(ip) {
+  const own = await arrive(ip, 'pub', PUBLIC_PER_HOUR, 3600);
+  if (own.limited || own.banned) return own;
+  const [, count] = await redis([
+    ['SET', 'rl:pubglobal', '0', 'EX', '3600', 'NX'],
+    ['INCR', 'rl:pubglobal'],
+  ]);
+  return { banned: false, limited: Number(count) > PUBLIC_GLOBAL_PER_HOUR };
+}
+
+/** Komut gonderen bir ayar guvenli degilse "Modul > Ayar" adini doner, yoksa null. */
+function unsafeCommand(config) {
+  for (const [moduleName, settings] of Object.entries(COMMAND_SETTINGS)) {
+    const mod = config[moduleName];
+    if (!mod || typeof mod !== 'object') continue;
+    for (const setting of settings) {
+      if (!(setting in mod)) continue;
+      const value = mod[setting];
+      if (typeof value !== 'string') return moduleName + ' > ' + setting;
+      const trimmed = value.trim();
+      if (trimmed && !SAFE_COMMAND.test(trimmed)) return moduleName + ' > ' + setting;
+    }
+  }
+  return null;
 }
 
 // ---- Guvenlik: hiz siniri, strike, otomatik ban ----
