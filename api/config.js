@@ -32,6 +32,7 @@
 //   7) Parametreli Redis komutlari (enjeksiyon yok), gizli indeksleme engeli, siki basliklar.
 
 import { createHash, createPublicKey, randomBytes, randomInt, timingSafeEqual, verify } from 'node:crypto';
+import { sqlReady, sqlRedis } from '../lib/sql-redis.js';
 
 // Hesap sitesinin admin-gecisi imza anahtarinin ACIK yarisi (gizli degildir; ozel yarisi yalnizca
 // hesap sitesinin Vercel ortaminda CLOUD_ADMIN_KEY olarak durur).
@@ -651,7 +652,10 @@ function credentials() {
   return (credentialsCache = null);
 }
 
+// Depo: TURSO_* env'leri varsa Turso (SQL; Upstash'in aylik komut kotasi yok, kart gerekmez),
+// yoksa Upstash REST. Ayni Redis komut arayuzu; asagidaki tum redis([...]) cagrilari degismez.
 async function redis(commands) {
+  if (sqlReady()) return sqlRedis(commands);
   const creds = credentials();
   if (!creds) throw new Error('storage-not-configured');
 

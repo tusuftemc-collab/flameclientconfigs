@@ -2,5 +2,8 @@
   "name": "flamev1-cloud",
   "private": true,
   "type": "module",
-  "description": "Flame V1 cloud configs (Vercel + Upstash Redis)"
+  "description": "Flame V1 cloud configs (Vercel + Turso, Upstash fallback)",
+  "scripts": {
+    "test": "node test/test-cloud-sql.mjs"
+  }
 }
